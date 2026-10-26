@@ -1,0 +1,25 @@
+[project]
+name = "kalshi-taker-spike"
+version = "0.1.0"
+description = "Model Spikes in Taker Flow on Kalshi"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lightgbm>=4.7.0",
+    "numpy>=2.5.4",
+    "pandas>=3.1.0",
+    "polars>=2.1.0",
+    "pyarrow>=26.0.0",
+    "pyyaml>=6.0.3",
+    "scipy>=1.17.1",
+    "torch>=2.14.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "matplotlib>=3.11.2",
+    "pytest>=9.1.1",
+    "ruff>=0.17.2",
+    "seaborn>=0.13.2",
+]
