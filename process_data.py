@@ -1,7 +1,7 @@
 import json
 import sys
 from collections import defaultdict
-from itertools import chain
+from itertools import chain, groupby
 from pathlib import Path
 
 import pyarrow as pa
@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 RAW_DIR, OUT_DIR = Path("raw_data"), Path("data")
 PRICE_SCALE = 1000
 SIZE_SCALE = 100
+MS_NS = 1_000_000
 DUST = 1
 MIN_VERIFIED = 1
 SHOW = 5
@@ -18,7 +19,8 @@ cat = pa.dictionary(pa.int8(), pa.string())
 SCHEMA = pa.schema(
     [
         ("event_seq", pa.uint64()),
-        ("timestamp_ns", pa.int64()),
+        ("timestamp_ns", pa.int64()),  # exchange ts_ms * 1e6 (snapshot: see build_rows)
+        ("recv_ns", pa.int64()),  # local receive time, kept for latency analysis
         ("delta_t_ms", pa.float32()),
         ("ticker", cat),
         ("event_type", cat),
@@ -47,6 +49,16 @@ def sz(s):
 def levels(pairs):
     """[["0.9030","50000.00"], ...] -> {903: 5000000}"""
     return {px(p): sz(s) for p, s in pairs if sz(s) > 0}
+
+
+def apply_delta(side, price, delta):
+    """Keep the raw running sum (may be transiently <= 0 when events are
+    reordered); only an exact zero is removed. add_row/strip hide non-positive."""
+    new_size = side.get(price, 0) + delta
+    if new_size == 0:
+        side.pop(price, None)
+    else:
+        side[price] = new_size
 
 
 def read_records(path):
@@ -112,10 +124,12 @@ def check(ckpt, books, stats):
         )
 
 
-def add_row(rows, last_ts, ticker, ts, event_type, book, trade=(None, None, None)):
+def add_row(
+    rows, last_ts, ticker, ts, recv_ns, event_type, book, trade=(None, None, None)
+):
     """book = {"yes": {price: size}, "no": {price: size}}"""
-    bids = sorted(book["yes"].items(), reverse=True)
-    asks = sorted((PRICE_SCALE - p, s) for p, s in book["no"].items())
+    bids = sorted(((p, s) for p, s in book["yes"].items() if s > 0), reverse=True)
+    asks = sorted((PRICE_SCALE - p, s) for p, s in book["no"].items() if s > 0)
     best_bid = bids[0][0] if bids else None
     best_ask = asks[0][0] if asks else None
     spread = best_ask - best_bid if best_bid and best_ask else None
@@ -124,6 +138,7 @@ def add_row(rows, last_ts, ticker, ts, event_type, book, trade=(None, None, None
         {
             "event_seq": len(rows),
             "timestamp_ns": ts,
+            "recv_ns": recv_ns,
             "delta_t_ms": None if prev is None else (ts - prev) / 1e6,
             "ticker": ticker,
             "event_type": event_type,
@@ -146,14 +161,85 @@ def new_stat(label):
     return {"label": label, "ok": 0, "bad": 0}
 
 
-def write_part(rows, stat):
-    if not rows:
-        return True
+# ---------------------------------------------------------------------------
+# Event ordering:
+#   1. exchange ts_ms
+#   2. within the same ts_ms: trades first (recv_ns order), then orderbook deltas
+#   3. deltas go from the top of the book to deeper levels: depth = number of
+#      existing levels on that side strictly better than the delta's price,
+#      measured on the book as it stands before the ts_ms group is applied
+#      (depth 0 = best level, or a new level that would become the best)
+#   4. at equal depth bid (yes) comes before ask (no); then better price first;
+#      recv_ns as the final tiebreak
+# ---------------------------------------------------------------------------
+SIDE_RANK = {"yes": 0, "no": 1}  # yes side = bids, no side = asks
+
+
+def base_key(rec):
+    d = rec["data"]
+    return (d["msg"]["ts_ms"], d["type"] != "trade", rec["recv_ns"])
+
+
+def order_deltas(deltas, book):
+    """Sort one ts_ms group's deltas from top of book down (bid before ask)."""
+
+    def key(rec):
+        m = rec["data"]["msg"]
+        side, price = m["side"], px(m["price_dollars"])
+        # on both sides a higher raw price is closer to the top of the book
+        depth = sum(1 for p, s in book[side].items() if s > 0 and p > price)
+        return (depth, SIDE_RANK[side], -price, rec["recv_ns"])
+
+    return sorted(deltas, key=key)
+
+
+def build_rows(seg):
+    tk = seg["ticker"]
+    snap = seg["snap"]
+    sm = snap["data"]["msg"]
+    events = sorted(seg["events"], key=base_key)
+    book = {
+        "yes": levels(sm.get("yes_dollars_fp", [])),
+        "no": levels(sm.get("no_dollars_fp", [])),
+    }
+    rows, last_ts = [], {}
+
+    # The snapshot message carries no exchange timestamp; use its recv time but
+    # never later than the first (sorted) event, so timestamp_ns stays monotone.
+    snap_ts = snap["recv_ns"]
+    if events:
+        snap_ts = min(snap_ts, events[0]["data"]["msg"]["ts_ms"] * MS_NS)
+    add_row(rows, last_ts, tk, snap_ts, snap["recv_ns"], "snapshot", book)
+
+    for ts_ms, grp in groupby(events, key=lambda r: r["data"]["msg"]["ts_ms"]):
+        grp = list(grp)
+        ts = ts_ms * MS_NS
+        trades = [r for r in grp if r["data"]["type"] == "trade"]
+        deltas = [r for r in grp if r["data"]["type"] != "trade"]
+        for rec in trades:
+            m = rec["data"]["msg"]
+            trade = (
+                px(m["yes_price_dollars"]),
+                sz(m["count_fp"]),
+                m["taker_side"] + "_taker",
+            )
+            add_row(rows, last_ts, tk, ts, rec["recv_ns"], "trade", book, trade)
+        for rec in order_deltas(deltas, book):
+            m = rec["data"]["msg"]
+            apply_delta(book[m["side"]], px(m["price_dollars"]), sz(m["delta_fp"]))
+            add_row(rows, last_ts, tk, ts, rec["recv_ns"], "delta_book", book)
+    return rows
+
+
+def write_segment(seg):
+    stat = seg["stat"]
+    n = len(seg["events"]) + 1
     if stat["bad"] or stat["ok"] < MIN_VERIFIED:
         print(
-            f"  SKIP  {stat['label']}: {len(rows)} rows, checkpoints ok={stat['ok']} bad={stat['bad']} (need bad=0 and ok>={MIN_VERIFIED})"
+            f"  SKIP  {stat['label']}: {n} rows, checkpoints ok={stat['ok']} bad={stat['bad']} (need bad=0 and ok>={MIN_VERIFIED})"
         )
         return False
+    rows = build_rows(seg)
     pq.write_table(
         pa.Table.from_pylist(rows, schema=SCHEMA),
         OUT_DIR / f"{stat['label']}.parquet",
@@ -173,8 +259,12 @@ def process_message_file(paths):
         ),
         key=lambda x: x[1],
     )
-    books, last_ts, rows, stats = {}, {}, defaultdict(list), {}
-    c = skipped = 0
+    # Pass 1 (recv order): checkpoints are stamped with asof_recv_ns, so they must
+    # be verified against the book replayed in receive order. Events are only
+    # collected per snapshot-delimited segment here; they are re-sorted by ts_ms
+    # when rows are built (deltas are additive, so the end state is the same).
+    books, cur, stats, segments = {}, {}, {}, []
+    c = 0
 
     for rec in chain.from_iterable(read_records(p) for p in paths):
         d = rec.get("data", {})
@@ -186,44 +276,33 @@ def process_message_file(paths):
             c += 1
 
         if t == "orderbook_snapshot":
-            if tk in books:
-                skipped += not write_part(rows[tk], stats[tk])
-                rows[tk] = []
-                stats[tk] = new_stat(f"{tk}_{ts}")
-                last_ts.pop(tk, None)
-            else:
-                stats[tk] = new_stat(f"{tk}_{recorder_ns}")
+            label = f"{tk}_{ts}" if tk in books else f"{tk}_{recorder_ns}"
+            seg = {"ticker": tk, "stat": new_stat(label), "snap": rec, "events": []}
+            segments.append(seg)
+            cur[tk] = seg
+            stats[tk] = seg["stat"]
             books[tk] = {
                 "yes": levels(m.get("yes_dollars_fp", [])),
                 "no": levels(m.get("no_dollars_fp", [])),
             }
-            add_row(rows[tk], last_ts, tk, ts, "snapshot", books[tk])
 
         elif tk not in books:
             continue
 
         elif t == "orderbook_delta":
-            side = books[tk][m["side"]]
-            price = px(m["price_dollars"])
-            new_size = side.get(price, 0) + sz(m["delta_fp"])
-            if new_size > 0:
-                side[price] = new_size
-            else:
-                side.pop(price, None)
-            add_row(rows[tk], last_ts, tk, ts, "delta_book", books[tk])
+            apply_delta(books[tk][m["side"]], px(m["price_dollars"]), sz(m["delta_fp"]))
+            cur[tk]["events"].append(rec)
 
         elif t == "trade":
-            trade = (
-                px(m["yes_price_dollars"]),
-                sz(m["count_fp"]),
-                m["taker_side"] + "_taker",
-            )
-            add_row(rows[tk], last_ts, tk, ts, "trade", books[tk], trade)
+            cur[tk]["events"].append(rec)
 
     for ckpt in ckpts[c:]:
         check(ckpt, books, stats)
-    for tk in rows:
-        skipped += not write_part(rows[tk], stats[tk])
+
+    # Pass 2: sort each verified segment by ts_ms and write.
+    skipped = 0
+    for seg in segments:
+        skipped += not write_segment(seg)
     return skipped
 
 
