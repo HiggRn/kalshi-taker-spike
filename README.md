@@ -2,6 +2,8 @@
 
 Group 1: Wiliam Chang (cc2983), Zijie Gu (zg353)
 
+Data horizon now: 2026-09-10 18:35 → 2026-10-30 12:08 ETC
+
 ## Market and Protocol
 
 - Venue and Mechanism: Kalshi centralized limit order book (CLOB) exchange for binary event contracts, continuous 24/7 double auction with strict price-time (FIFO) priority.
