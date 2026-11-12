@@ -222,5 +222,4 @@ __marimo__/
 # Custom
 raw_data/
 data/
-echo logs2/
-raw_data.zip
+results/
