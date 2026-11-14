@@ -5,6 +5,7 @@ from itertools import chain, groupby
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 RAW_DIR, OUT_DIR = Path("raw_data"), Path("data")
@@ -34,6 +35,7 @@ SCHEMA = pa.schema(
         ("trade_price", pa.int32()),
         ("trade_size", pa.int64()),
         ("taker_side", cat),
+        ("segment", cat),  # one per verified snapshot-delimited segment
     ]
 )
 
@@ -239,14 +241,13 @@ def write_segment(seg):
             f"  SKIP  {stat['label']}: {n} rows, checkpoints ok={stat['ok']} bad={stat['bad']} (need bad=0 and ok>={MIN_VERIFIED})"
         )
         return False
+    if not seg["events"]:
+        return None  # snapshot only: nothing to model
     rows = build_rows(seg)
-    pq.write_table(
-        pa.Table.from_pylist(rows, schema=SCHEMA),
-        OUT_DIR / f"{stat['label']}.parquet",
-        compression="zstd",
-    )
-    print(f"  WRITE {stat['label']}: {len(rows)} rows, checkpoints ok={stat['ok']}")
-    return True
+    for r in rows:
+        r["segment"] = stat["label"]
+    print(f"  OK    {stat['label']}: {len(rows)} rows, checkpoints ok={stat['ok']}")
+    return pa.Table.from_pylist(rows, schema=SCHEMA)
 
 
 def process_message_file(paths):
@@ -299,11 +300,23 @@ def process_message_file(paths):
     for ckpt in ckpts[c:]:
         check(ckpt, books, stats)
 
-    # Pass 2: sort each verified segment by ts_ms and write.
-    skipped = 0
-    for seg in segments:
-        skipped += not write_segment(seg)
-    return skipped
+    # Pass 2: sort each verified segment by ts_ms into a table.
+    tables = [write_segment(seg) for seg in segments]
+    return [t for t in tables if isinstance(t, pa.Table)], tables.count(False)
+
+
+def combine(tables):
+    """Concatenate one ticker's segments in time order. Where segments overlap
+    (two recorders running at once), cut the earlier one at the later one's
+    snapshot: the later book is exact from its snapshot, the earlier copy of
+    the overlap is a duplicate."""
+    tables.sort(key=lambda t: t["timestamp_ns"][0].as_py())
+    parts = [
+        a.filter(pc.less(a["timestamp_ns"], b["timestamp_ns"][0]))
+        for a, b in zip(tables, tables[1:])
+    ] + tables[-1:]
+    out = pa.concat_tables(parts)
+    return out.set_column(0, "event_seq", pa.array(range(len(out)), pa.uint64()))
 
 
 if __name__ == "__main__":
@@ -315,9 +328,17 @@ if __name__ == "__main__":
             continue
         _, recorder, _, ticker = path.stem.split("__")
         groups[(recorder, ticker)].append(path)
+    by_ticker = defaultdict(list)
     for paths in groups.values():
         print(", ".join(p.name for p in paths))
-        skipped += process_message_file(paths)
+        tables, n_skip = process_message_file(paths)
+        skipped += n_skip
+        for t in tables:
+            by_ticker[t["ticker"][0].as_py()].append(t)
+    for tk, tables in sorted(by_ticker.items()):
+        out = combine(tables)
+        pq.write_table(out, OUT_DIR / f"{tk}.parquet", compression="zstd")
+        print(f"WRITE {tk}: {len(out)} rows, {len(tables)} segments")
     if skipped:
         print(f"\n{skipped} parts are skipped due to checkpoint mismatch.")
         sys.exit(1)

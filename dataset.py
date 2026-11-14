@@ -91,7 +91,9 @@ def _load_single_chunk(label_path: Path, raw_dir: Path = DATA_DIR) -> pl.DataFra
     )
 
     # Join on (timestamp_ns, event_seq)
-    df = lbl_df.join(cluster_raw, on=["timestamp_ns", "event_seq"], how="inner")
+    df = lbl_df.join(
+        cluster_raw, on=["timestamp_ns", "event_seq"], how="inner", maintain_order="left"
+    )
 
     # Convert L2 book into unified R-frame:
     # - r_bid_*: resting liquidity supporting R (depleted by sellR takers)
@@ -141,6 +143,7 @@ def _load_single_chunk(label_path: Path, raw_dir: Path = DATA_DIR) -> pl.DataFra
         (pl.col("spread").cast(pl.Float64) / PRICE_SCALE).alias("spread_prob"),
         pl.col("timestamp_ns")
         .diff()
+        .over("chunk_id")
         .fill_null(0)
         .truediv(1_000_000.0)
         .alias("dt_cluster_ms"),
@@ -225,7 +228,7 @@ class MarketDataset:
                     f"{s}={n:,}" for s, n in zip(splits["split"], splits["len"])
                 )
                 print(
-                    f"[Dataset] {contract:<14} | chunks={len(dfs):2d} | total={len(combined):9,d} ({split_str})"
+                    f"[Dataset] {contract:<14} | chunks={combined['chunk_id'].n_unique():2d} | total={len(combined):9,d} ({split_str})"
                 )
 
         return self

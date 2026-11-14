@@ -1,3 +1,4 @@
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -56,27 +57,32 @@ big_ts = {
     for (tk, side), g in big.group_by(["ticker", "taker_side"])
 }
 
-for f in files:
-    df = (
-        pl.read_parquet(
-            f,
-            columns=[
-                "event_seq",
-                "timestamp_ns",
-                "ticker",
-                "event_type",
-                "best_bid",
-                "best_ask",
-                "trade_size",
-                "taker_side",
-            ],
-        )
-        .cast({"ticker": pl.Utf8, "event_type": pl.Utf8, "taker_side": pl.Utf8})
-        .filter(pl.col("event_type") != "snapshot")
+# one chunk per verified segment (continuous book between reconnects)
+chunks = [
+    g
+    for f in files
+    for g in pl.read_parquet(
+        f,
+        columns=[
+            "event_seq",
+            "timestamp_ns",
+            "ticker",
+            "event_type",
+            "best_bid",
+            "best_ask",
+            "trade_size",
+            "taker_side",
+            "segment",
+        ],
     )
-    if df.is_empty():
-        continue
-    tk = df["ticker"][0]
+    .cast({c: pl.Utf8 for c in ("ticker", "event_type", "taker_side", "segment")})
+    .filter(pl.col("event_type") != "snapshot")
+    .partition_by("segment", maintain_order=True)
+]
+labelled = defaultdict(list)
+
+for df in chunks:
+    tk, seg = df["ticker"][0], df["segment"][0]
     contract, party = tk.rsplit("-", 1)
     pair = f"{contract}-{'D' if party == 'R' else 'R'}"
     side_dir = DIRS[party]
@@ -111,7 +117,7 @@ for f in files:
     if n < W + max(
         H_GRID
     ):  # reconnect fragment: no row can have lookback + forward window
-        print(f"{f.name}: skipped ({n} clusters)")
+        print(f"{seg}: skipped ({n} clusters)")
         continue
     mid = (
         (c["best_bid"].cast(pl.Float64) + c["best_ask"].cast(pl.Float64)).to_numpy()
@@ -129,7 +135,7 @@ for f in files:
         "ticker": [tk] * n,
         "contract": [contract] * n,
         "party": [party] * n,
-        "chunk_id": [f.stem] * n,
+        "chunk_id": [seg] * n,
         "event_seq": c["event_seq"].to_numpy(),
         "cluster_id": np.arange(n),
         "timestamp_ns": ts,
@@ -190,10 +196,12 @@ for f in files:
             out[f"y_sd_{sfx}"] = np.where(ok, fwd > thr_sd, np.nan)
             out[f"y_onset_{sfx}"] = np.where(ok, spike & (bwd < thr_q), np.nan)
 
-    (
+    labelled[tk].append(
         pl.DataFrame(out)
         .with_columns(pl.col(pl.Float32, pl.Float64).fill_nan(None))
         .with_columns(pl.col("^y.*$").cast(pl.Int8))
-        .write_parquet(OUT_DIR / f.name, compression="zstd")
     )
-    print(f"{f.name}: {n} clusters")
+    print(f"{seg}: {n} clusters")
+
+for tk, parts in labelled.items():
+    pl.concat(parts).write_parquet(OUT_DIR / f"{tk}.parquet", compression="zstd")
