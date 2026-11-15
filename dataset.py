@@ -2,7 +2,7 @@ from pathlib import Path
 
 import polars as pl
 
-DATA_DIR = Path("data")
+DATA_DIR = Path("data/processed")
 LABEL_DIR = Path("data/labelled")
 PRICE_SCALE = 1000.0
 SIZE_SCALE = 100.0
@@ -92,7 +92,10 @@ def _load_single_chunk(label_path: Path, raw_dir: Path = DATA_DIR) -> pl.DataFra
 
     # Join on (timestamp_ns, event_seq)
     df = lbl_df.join(
-        cluster_raw, on=["timestamp_ns", "event_seq"], how="inner", maintain_order="left"
+        cluster_raw,
+        on=["timestamp_ns", "event_seq"],
+        how="inner",
+        maintain_order="left",
     )
 
     # Convert L2 book into unified R-frame:

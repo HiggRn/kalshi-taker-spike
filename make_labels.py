@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-IN_DIR, OUT_DIR = Path("data"), Path("data/labelled")
+IN_DIR, OUT_DIR = Path("data/processed"), Path("data/labelled")
 PRICE_SCALE, SIZE_SCALE, MS_NS = 1000, 100, 1_000_000
 
 W = 2000  # lookback, in clusters

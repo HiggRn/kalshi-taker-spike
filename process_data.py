@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-RAW_DIR, OUT_DIR = Path("raw_data"), Path("data")
+RAW_DIR, OUT_DIR = Path("data/raw"), Path("data/processed")
 PRICE_SCALE = 1000
 SIZE_SCALE = 100
 MS_NS = 1_000_000
