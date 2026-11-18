@@ -1,5 +1,7 @@
 import argparse
+import json
 import time
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
@@ -62,6 +64,12 @@ def parse_args():
         action="store_true",
         help="If set, save per-cluster test predictions to results/",
     )
+    parser.add_argument(
+        "--tag",
+        type=str,
+        default="",
+        help="Optional label appended to the run directory name (e.g. 'sign_fix')",
+    )
     return parser.parse_args()
 
 
@@ -97,8 +105,19 @@ if __name__ == "__main__":
 
     train_df, val_df = ds.get_primary_train_val()
     summary_rows = []
-    out_dir = Path(args.save_dir)
-    out_dir.mkdir(exist_ok=True)
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.tag:
+        run_id += f"_{args.tag}"
+    out_dir = Path(args.save_dir) / run_id
+    out_dir.mkdir(parents=True, exist_ok=False)  # never reuse an existing run dir
+    with open(out_dir / "run_config.json", "w") as f:
+        json.dump(
+            {**vars(args), "selected_models": selected_models, "run_id": run_id},
+            f,
+            indent=2,
+        )
+    print(f"[*] Results will be saved to {out_dir}")
 
     for model_name in selected_models:
         print(f"--- [Model: {model_name}] Training on {PRIMARY_CONTRACT} ---")
