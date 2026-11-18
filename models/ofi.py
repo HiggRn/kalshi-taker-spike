@@ -57,8 +57,8 @@ class OFILinearGLM(BaseSpikeModel):
         step_ofi_top5 = (
             pl.col("r_bid_sz_top5").diff().over("chunk_id").fill_null(0.0)
             - pl.col("r_ask_sz_top5").diff().over("chunk_id").fill_null(0.0)
-            + pl.col("v_buyR")
-            - pl.col("v_sellR")
+            - pl.col("v_buyR")
+            + pl.col("v_sellR")
         )
 
         # 2. Multi-level OBI & Book Geometry in R-frame

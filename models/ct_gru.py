@@ -102,8 +102,8 @@ class CTGRUModel(BaseSpikeModel):
         step_ofi_top5 = (
             pl.col("r_bid_sz_top5").diff().over("chunk_id").fill_null(0.0)
             - pl.col("r_ask_sz_top5").diff().over("chunk_id").fill_null(0.0)
-            + pl.col("v_buyR")
-            - pl.col("v_sellR")
+            - pl.col("v_buyR")
+            + pl.col("v_sellR")
         )
 
         dt_ms = pl.col("dt_cluster_ms").fill_null(0.0).clip(lower_bound=0.0)
