@@ -6,8 +6,8 @@ from evaluate import compute_pr_auc
 from models import BaseSpikeModel, TargetConfig, register_model
 
 
-@register_model("hawkes")
-class HawkesModel(BaseSpikeModel):
+@register_model("tfi_hawkes")
+class TFIHawkesModel(BaseSpikeModel):
     """Trade-Only Self-Exciting Baseline
 
     Uses multi-scale EWMAs of directional taker volumes, backward H-block
